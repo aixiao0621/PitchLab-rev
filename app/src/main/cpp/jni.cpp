@@ -213,6 +213,16 @@ void low_pass_filter(kiss_fft_cpx* spectrum, int len, int sample_rate, float cut
     }
 }
 
+#define LARGE_BUFFER_SIZE (4096 * 4)
+static float large_buffer[LARGE_BUFFER_SIZE];  // 大的浮点缓冲区
+static int large_buffer_index = 0;             // 缓冲区的当前索引
+// 记录样本到大缓冲区函数
+void record_samples_to_large_buffer(jshort *samples, int num_samples) {
+    for (int i = 0; i < num_samples && large_buffer_index < LARGE_BUFFER_SIZE; ++i) {
+        // 将短整型样本转换为浮点数，并存储到大缓冲区中
+        large_buffer[large_buffer_index++] = (float) samples[i];
+    }
+}
 extern "C" {
 JNIEXPORT void JNICALL
 Java_com_symbolic_pitchlab_PitchLabNative_processStreamedSamples(
@@ -222,8 +232,6 @@ Java_com_symbolic_pitchlab_PitchLabNative_processStreamedSamples(
         jint bf_size,   // 3584
         jint sample_rate
 ) {
-    const int fft_size = 4096; // 设置FFT的大小为4096
-
     // 获取Java数组的数据
     jshort *audio_samples = (*env).GetShortArrayElements(s_arr, NULL);
     if (audio_samples == NULL) {
@@ -231,55 +239,66 @@ Java_com_symbolic_pitchlab_PitchLabNative_processStreamedSamples(
         return; // JNI异常已抛出
     }
 
-    // 分配并初始化FFT的输入数组，填充额外的零
-    kiss_fft_cpx *fin = (kiss_fft_cpx *) calloc(fft_size, sizeof(kiss_fft_cpx));
-    if (!fin) {
-        // 处理calloc失败的情况
-        (*env).ReleaseShortArrayElements(s_arr, audio_samples, 0);
-        return;
-    }
+    // 将接收到的样本添加到大缓冲区
+    record_samples_to_large_buffer(audio_samples, bf_size);
 
-    // 将bf_size个PCM数据复制到fin，剩余的部分是零
-    for (int i = 0; i < bf_size; ++i) {
-        fin[i].r = (float) audio_samples[i];
-        fin[i].i = 0.0; // 实际上calloc已经初始化为0
-    }
+    // 检查大缓冲区是否已经收集了足够的样本来进行FFT
+    if (large_buffer_index >= LARGE_BUFFER_SIZE) {
+        // 分配并初始化FFT的输入数组
+        kiss_fft_cpx *fin = (kiss_fft_cpx *) calloc(LARGE_BUFFER_SIZE, sizeof(kiss_fft_cpx));
+        if (!fin) {
+            // 释放Java数组引用并返回
+            (*env).ReleaseShortArrayElements(s_arr, audio_samples, 0);
+            return;
+        }
 
-    // 分配FFT的输出数组
-    kiss_fft_cpx *fout = (kiss_fft_cpx *) malloc(sizeof(kiss_fft_cpx) * fft_size);
-    if (!fout) {
-        // 处理malloc失败的情况
-        free(fin);
-        (*env).ReleaseShortArrayElements(s_arr, audio_samples, 0);
-        return;
-    }
+        // 复制大缓冲区中的样本到FFT输入数组
+        for (int i = 0; i < LARGE_BUFFER_SIZE; ++i) {
+            fin[i].r = large_buffer[i];
+            // FFT输入的虚部保持为0（calloc已经初始化）
+        }
 
-    // 分配FFT配置
-    kiss_fft_cfg cfg = kiss_fft_alloc(fft_size, 0, NULL, NULL);
-    if (!cfg) {
-        // 处理FFT配置分配失败的情况
+        // 分配FFT的输出数组
+        kiss_fft_cpx *fout = (kiss_fft_cpx *) malloc(sizeof(kiss_fft_cpx) * LARGE_BUFFER_SIZE);
+        if (!fout) {
+            // 释放资源并返回
+            free(fin);
+            (*env).ReleaseShortArrayElements(s_arr, audio_samples, 0);
+            return;
+        }
+
+        // 分配FFT配置
+        kiss_fft_cfg cfg = kiss_fft_alloc(4096*4, 0, NULL, NULL);
+        if (!cfg) {
+            // 释放资源并返回
+            free(fin);
+            free(fout);
+            (*env).ReleaseShortArrayElements(s_arr, audio_samples, 0);
+            return;
+        }
+
+        // 应用汉宁窗
+        apply_hanning_window((complex_float *) fin, LARGE_BUFFER_SIZE);
+
+        // 执行FFT
+        kiss_fft(cfg, fin, fout);
+
+        // 根据新的FFT大小设置gResultsLength
+        gResultsLength = LARGE_BUFFER_SIZE / 2;
+        float cutoff_frequency = 1000.0f; // 设定一个合适的截止频率以去除谐波
+        low_pass_filter(fout, gResultsLength, sample_rate, cutoff_frequency);
+
+        // 计算频率和分贝值
+        calculate_frequency_and_db(fout, LARGE_BUFFER_SIZE, sample_rate);
+
+        // 清理并释放资源
+        kiss_fft_free(cfg);
         free(fin);
         free(fout);
-        (*env).ReleaseShortArrayElements(s_arr, audio_samples, 0);
-        return;
+
+        // 重置大缓冲区索引
+        large_buffer_index = 0;
     }
-
-    // 应用汉明窗
-    apply_hanning_window((complex_float *) fin, fft_size);
-
-    // 执行FFT
-    kiss_fft(cfg, fin, fout);
-
-    float cutoff_frequency = 1000.0f; // 1000 Hz 以上假定为谐波区域
-    low_pass_filter(fout, gResultsLength, sample_rate, cutoff_frequency);
-
-    // 计算频率和分贝值
-    calculate_frequency_and_db(fout, fft_size, sample_rate);
-
-    // 清理并释放资源
-    kiss_fft_free(cfg);
-    free(fin);
-    free(fout);
 
     // 释放Java数组引用
     (*env).ReleaseShortArrayElements(s_arr, audio_samples, 0);
