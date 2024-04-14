@@ -26,7 +26,13 @@ project("PitchLab")
 # used in the AndroidManifest.xml file.
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
-        jni.c)
+        jni.cpp
+        kiss_fft.cpp
+        kiss_fftr.cpp
+        kiss_fft.h
+        kiss_fftr.h
+        _kiss_fft_guts.h
+)
 
 # Specifies libraries CMake should link to your target library. You
 # can link libraries from various origins, such as libraries defined in this
